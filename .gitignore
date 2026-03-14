@@ -1,0 +1,15 @@
+# OS generated files
+.DS_Store
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files
+*.csv
+
+# Secrets and Credentials
+aws_db_creds.py
+write_ghsteet.json
+.env

@@ -1,174 +1,140 @@
 WITH dates AS (
-    SELECT date('2026-03-08') AS max_date
+    SELECT DATE '{{target_date}}' AS max_date
 ),
 
 base AS (
-    SELECT *
-    FROM (
-        SELECT DISTINCT upper(battery_oem_no) as battery_oem_no,
-        substr(battery_oem_no, 1, 1) AS oem_prefix,
-        ROW_NUMBER() OVER (PARTITION BY battery_oem_no ORDER BY modified_time DESC) AS rnk
-        FROM "AWSDataCatalog"."prod_landing_db"."atlas_battery_360"
-        CROSS JOIN dates
-        WHERE substr(battery_oem_no, 1, 1) IN ('U', 'A', 'C', '7', '8', 'D')
-        AND length(battery_oem_no) IN (15, 18)
-        AND date(modified_time) <= max_date
-    )WHERE rnk = 1
+    SELECT upper(b.battery_oem_no) AS battery_oem_no,
+           substr(upper(b.battery_oem_no), 1, 1) AS oem_prefix,
+           MAX_BY(b.country_code, CASE WHEN b.country_code IS NOT NULL THEN b.modified_time ELSE NULL END) AS country_code
+    FROM "AWSDataCatalog"."prod_landing_db"."atlas_battery_360" b
+    CROSS JOIN dates d
+    WHERE substr(upper(b.battery_oem_no), 1, 1) IN ('U', 'A', 'C', '7', '8', 'D')
+      AND length(b.battery_oem_no) IN (15, 18)
+      AND CAST(b.modified_time AS DATE) <= d.max_date
+    GROUP BY upper(b.battery_oem_no)
 ),
 
 cbak AS (
-    SELECT bmsid,event_time,soc,
-    ROW_NUMBER() OVER (PARTITION BY bmsid ORDER BY _time DESC) AS rnk,
-    SUM(is_new_hour) OVER (PARTITION BY bmsid ORDER BY _time)   AS week_pac
-    FROM (
-        SELECT
-        t.bmsid,t._time,from_unixtime(t._time / 1000000000)AS event_time,CAST(t.soc AS DOUBLE)AS soc,
-        CASE WHEN date_diff('day',date(from_unixtime(t._time / 1000000000)), d.max_date)>=7  THEN 0
-        WHEN LAG(hour(from_unixtime(t._time / 1000000000)))OVER (PARTITION BY t.bmsid ORDER BY t._time)=hour(from_unixtime(t._time / 1000000000))THEN 0 ELSE 1 END AS is_new_hour
-        FROM "AWSDataCatalog"."prod_landing_db"."iot_hubtrakmate" t
-        CROSS JOIN dates d
-        INNER JOIN base b ON t.bmsid = b.battery_oem_no AND b.oem_prefix = 'C'
-        WHERE date(t.partition_0 || '-' || t.partition_1 || '-' || t.partition_2) <= d.max_date
-        and lower(product) not like '%veh%' 
-    )
+    SELECT t.bmsid AS battery_id,
+           MAX(from_unixtime(t._time / 1000000000)) AS last_connected,
+           MAX_BY(CAST(t.soc AS DOUBLE), t._time) AS soc,
+           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(from_unixtime(t._time / 1000000000) AS DATE), d.max_date) < 7 
+                               THEN date_trunc('hour', from_unixtime(t._time / 1000000000)) END) AS week_pac
+    FROM "AWSDataCatalog"."prod_landing_db"."iot_hubtrakmate" t
+    CROSS JOIN dates d
+    INNER JOIN base b ON upper(t.bmsid) = b.battery_oem_no AND b.oem_prefix = 'C'
+    WHERE CAST(t.partition_0 || '-' || t.partition_1 || '-' || t.partition_2 AS DATE) <= d.max_date
+      AND lower(t.product) NOT LIKE '%veh%'
+    GROUP BY t.bmsid, d.max_date
 ),
 
 unique_bat AS (
-    SELECT batid,event_time,soc,
-    ROW_NUMBER() OVER (PARTITION BY batid ORDER BY _time DESC) AS rnk,
-    SUM(is_new_hour) OVER (PARTITION BY batid ORDER BY _time)   AS week_pac
-    FROM (
-        SELECT t.batid,t._time,from_unixtime(t._time / 1000000000) AS event_time,CAST(t.soc AS DOUBLE) AS soc,
-        CASE WHEN date_diff('day',date(from_unixtime(t._time / 1000000000)),d.max_date)>=7  THEN 0
-        WHEN LAG(hour(from_unixtime(t._time / 1000000000)))OVER (PARTITION BY t.batid ORDER BY t._time)=hour(from_unixtime(t._time / 1000000000))THEN 0 ELSE 1 END AS is_new_hour
-        FROM "AWSDataCatalog"."prod_landing_db"."iot_hub6" t
-        CROSS JOIN dates d
-        INNER JOIN base b ON t.batid = b.battery_oem_no AND b.oem_prefix = 'U'
-        WHERE date(t.partition_0 || '-' || t.partition_1 || '-' || t.partition_2) <= d.max_date
-    )
+    SELECT t.batid AS battery_id,
+           MAX(from_unixtime(t._time / 1000000000)) AS last_connected,
+           MAX_BY(CAST(t.soc AS DOUBLE), t._time) AS soc,
+           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(from_unixtime(t._time / 1000000000) AS DATE), d.max_date) < 7 
+                               THEN date_trunc('hour', from_unixtime(t._time / 1000000000)) END) AS week_pac
+    FROM "AWSDataCatalog"."prod_landing_db"."iot_hub6" t
+    CROSS JOIN dates d
+    INNER JOIN base b ON upper(t.batid) = b.battery_oem_no AND b.oem_prefix = 'U'
+    WHERE CAST(t.partition_0 || '-' || t.partition_1 || '-' || t.partition_2 AS DATE) <= d.max_date
+    GROUP BY t.batid, d.max_date
 ),
 
 amp_green AS (
-    SELECT bms_id,event_time,soc,
-    ROW_NUMBER() OVER (PARTITION BY bms_id ORDER BY device_time DESC) AS rnk,
-    SUM(is_new_hour) OVER (PARTITION BY bms_id ORDER BY device_time)   AS week_pac
-    FROM (
-        SELECT t.bms_id,t.device_time,FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)  AS event_time,CAST(t.battery_soc AS DOUBLE) AS soc,
-        CASE
-        WHEN date_diff('day',date(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)), d.max_date)>=7  THEN 0
-        WHEN LAG(hour(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)))OVER (PARTITION BY t.bms_id ORDER BY t.device_time)= hour(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000))THEN 0 ELSE 1 END AS is_new_hour
-        FROM "Data-Athena-Prod"."landing_db"."iot_bms_telemetry_critical" t
-        CROSS JOIN dates d
-        INNER JOIN base b ON t.bms_id = b.battery_oem_no AND b.oem_prefix IN ('A', '7', '8')
-        WHERE date(t.year || '-' || t.month || '-' || t.day) <= d.max_date
-    )
+    SELECT t.bms_id AS battery_id,
+           MAX(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)) AS last_connected,
+           MAX_BY(CAST(t.battery_soc AS DOUBLE), t.device_time) AS soc,
+           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000) AS DATE), d.max_date) < 7 
+                               THEN date_trunc('hour', FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)) END) AS week_pac
+    FROM "Data-Athena-Prod"."landing_db"."iot_bms_telemetry_critical" t
+    CROSS JOIN dates d
+    INNER JOIN base b ON upper(t.bms_id) = b.battery_oem_no AND b.oem_prefix IN ('A', '7', '8')
+    WHERE CAST(t.year || '-' || t.month || '-' || t.day AS DATE) <= d.max_date
+    GROUP BY t.bms_id, d.max_date
 ),
 
 combined AS (
-    SELECT bmsid AS battery_id, event_time AS last_connected, soc, week_pac FROM cbak WHERE rnk = 1
+    SELECT battery_id, last_connected, soc, week_pac FROM cbak
     UNION ALL
-    SELECT batid,event_time,soc,week_pac FROM unique_bat WHERE rnk = 1
+    SELECT battery_id, last_connected, soc, week_pac FROM unique_bat
     UNION ALL
-    SELECT bms_id,event_time,soc,week_pac FROM amp_green  WHERE rnk = 1
+    SELECT battery_id, last_connected, soc, week_pac FROM amp_green
 ),
 
 latest_bms AS (
-    SELECT bms_id, last_updated_time AS last_connection_attempted
-    FROM (
-        SELECT t.bms_id,t.last_updated_time,
-        ROW_NUMBER() OVER (PARTITION BY t.bms_id ORDER BY t.last_updated_time DESC) AS rnk
-        FROM "Data-Athena-Prod"."landing_db"."latest_bms" t
-        CROSS JOIN dates d
-        INNER JOIN base b ON t.bms_id = b.battery_oem_no
-        WHERE date(CAST(t.last_updated_time AS TIMESTAMP)) <= d.max_date
-    )WHERE rnk = 1
+    SELECT t.bms_id,
+           MAX(CAST(t.last_updated_time AS TIMESTAMP)) AS last_connection_attempted
+    FROM "Data-Athena-Prod"."landing_db"."latest_bms" t
+    CROSS JOIN dates d
+    INNER JOIN base b ON upper(t.bms_id) = b.battery_oem_no
+    -- Need to check timestamp up to end of max_date
+    WHERE CAST(t.last_updated_time AS TIMESTAMP) <= CAST(d.max_date AS TIMESTAMP) + INTERVAL '1' DAY
+    GROUP BY t.bms_id
 ),
 
 temp AS (
-    select a.*, b.country_code 
-    from(
     SELECT b.battery_oem_no,
-    CASE b.oem_prefix
-    WHEN 'C' THEN 'CBAK'
-    WHEN 'U' THEN 'Unique'
-    WHEN 'A' THEN 'Ampace'
-    WHEN '7' THEN 'Greenway-1'
-    WHEN '8' THEN 'Greenway-1'
-    WHEN 'D' THEN 'Greenway-2'
-    END AS battery_family,c.last_connected,
-        -- FIX: was hardcoded DATE '2026-03-01'; now uses max_date consistently
-    date_diff('day', c.last_connected, CAST(d.max_date AS TIMESTAMP)) AS days_from_last_connected,
-    CAST(l.last_connection_attempted AS TIMESTAMP) AS last_connection_attempted,
-    date_diff('day', CAST(l.last_connection_attempted AS TIMESTAMP),
-    CAST(d.max_date AS TIMESTAMP))AS days_from_last_connection_attempt,
-    date_diff('day', c.last_connected,CAST(l.last_connection_attempted AS TIMESTAMP))AS delta_packet_loss_days,
-    c.soc,
-    c.week_pac
+           CASE b.oem_prefix
+               WHEN 'C' THEN 'CBAK'
+               WHEN 'U' THEN 'Unique'
+               WHEN 'A' THEN 'Ampace'
+               WHEN '7' THEN 'Greenway-1'
+               WHEN '8' THEN 'Greenway-1'
+               WHEN 'D' THEN 'Greenway-2'
+           END AS battery_family,
+           c.last_connected,
+           date_diff('day', CAST(c.last_connected AS DATE), d.max_date) AS days_from_last_connected,
+           l.last_connection_attempted,
+           date_diff('day', CAST(l.last_connection_attempted AS DATE), d.max_date) AS days_from_last_connection_attempt,
+           date_diff('day', CAST(c.last_connected AS DATE), CAST(l.last_connection_attempted AS DATE)) AS delta_packet_loss_days,
+           c.soc,
+           c.week_pac,
+           b.country_code
     FROM base b
     CROSS JOIN dates d
-    LEFT JOIN combined   c ON b.battery_oem_no = c.battery_id
-    LEFT JOIN latest_bms l ON b.battery_oem_no = l.bms_id
-    )a left join(
-    SELECT *
-    FROM (
-        SELECT DISTINCT upper(battery_oem_no) as battery_oem_no,country_code,
-        ROW_NUMBER() OVER (PARTITION BY battery_oem_no ORDER BY modified_time DESC) AS rnk
-        FROM "AWSDataCatalog"."prod_landing_db"."atlas_battery_360"
-        CROSS JOIN dates
-        WHERE substr(battery_oem_no, 1, 1) IN ('U', 'A', 'C', '7', '8', 'D')
-        AND length(battery_oem_no) IN (15, 18)
-        AND date(modified_time) <= max_date
-        and country_code is not null
-    )WHERE rnk = 1
-    )b on a.battery_oem_no=b.battery_oem_no
+    LEFT JOIN combined c ON b.battery_oem_no = upper(c.battery_id)
+    LEFT JOIN latest_bms l ON b.battery_oem_no = upper(l.bms_id)
 ),
 
 swap_events AS (
-    -- Swapped IN
-    SELECT DISTINCT a.oem_in AS oem,a.modified_time,CAST(a.current_soc_in AS DOUBLE) AS swapped_soc,'Swapped in'AS tag,
-    count(case when cast(modified_time as timestamp)>cast(last_connected as timestamp) then oem_in else null end)over(partition by oem_in order by modified_time) as swaps
-    FROM "prod_landing_db"."atlas_swapping_transactions" a
+    SELECT oem_in AS oem, modified_time, CAST(current_soc_in AS DOUBLE) AS swapped_soc, 'Swapped in' AS tag
+    FROM "prod_landing_db"."atlas_swapping_transactions"
     CROSS JOIN dates d
-    INNER JOIN temp b ON a.oem_in = b.battery_oem_no
-    AND date(a.modified_time) >=  TIMESTAMP '2023-01-01 00:00:00'
-    WHERE date(a.modified_time) <= d.max_date
-
+    WHERE CAST(modified_time AS DATE) >= DATE '2023-01-01'
+      AND CAST(modified_time AS DATE) <= d.max_date
     UNION ALL
-
-    -- Swapped OUT
-    SELECT DISTINCT a.oem_out AS oem,a.modified_time,CAST(a.current_soc_out AS DOUBLE) AS swapped_soc,'Swapped out'AS tag,
-    count(case when cast(modified_time as timestamp)>cast(last_connected as timestamp) then oem_out else null end)over(partition by oem_out order by modified_time) as swaps
-    FROM "prod_landing_db"."atlas_swapping_transactions" a
+    SELECT oem_out AS oem, modified_time, CAST(current_soc_out AS DOUBLE) AS swapped_soc, 'Swapped out' AS tag
+    FROM "prod_landing_db"."atlas_swapping_transactions"
     CROSS JOIN dates d
-    INNER JOIN temp b ON a.oem_out = b.battery_oem_no
-    AND a.modified_time >=  TIMESTAMP '2023-01-01 00:00:00'
-    WHERE date(a.modified_time) <= d.max_date
+    WHERE CAST(modified_time AS DATE) >= DATE '2023-01-01'
+      AND CAST(modified_time AS DATE) <= d.max_date
 ),
 
 swaps AS (
-    SELECT oem,modified_time,swapped_soc,tag,
-    case when sum(swaps)over(PARTITION BY oem ORDER BY modified_time)=0 then 
-    count(*)over(partition by oem order by modified_time)
-    else sum(swaps)over(PARTITION BY oem ORDER BY modified_time) end 
-    as swaps,
-        -- FIX: was missing END keyword and had broken subquery syntax
-        COUNT(CASE WHEN date_diff('day',date(modified_time), d.max_date)<=7  THEN oem ELSE NULL END)
-        OVER (PARTITION BY oem ORDER BY modified_time) AS circulation_batteries,
-        ROW_NUMBER() OVER (PARTITION BY oem ORDER BY modified_time DESC) AS rnk
-    FROM swap_events
+    SELECT upper(e.oem) AS oem,
+           MAX(e.modified_time) AS modified_time,
+           MAX_BY(e.swapped_soc, e.modified_time) AS swapped_soc,
+           MAX_BY(e.tag, e.modified_time) AS tag,
+           COUNT(*) AS total_swaps,
+           COUNT(CASE WHEN CAST(e.modified_time AS TIMESTAMP) > CAST(t.last_connected AS TIMESTAMP) THEN 1 END) AS swaps_after_last_connected,
+           COUNT(CASE WHEN date_diff('day', CAST(e.modified_time AS DATE), d.max_date) <= 7 THEN 1 END) AS circulation_batteries
+    FROM swap_events e
     CROSS JOIN dates d
+    INNER JOIN temp t ON upper(e.oem) = t.battery_oem_no
+    GROUP BY upper(e.oem), t.last_connected, d.max_date
 )
 
 SELECT
     t.*,
-    s.swaps,
+    CASE WHEN s.swaps_after_last_connected = 0 THEN s.total_swaps ELSE s.swaps_after_last_connected END AS swaps,
     s.circulation_batteries,
     s.tag,
     s.swapped_soc,
     s.modified_time AS last_swapped,
     COALESCE(s.swapped_soc, t.soc) AS final_soc,
-    COALESCE(s.modified_time, t.last_connected) AS soc_depletion_ts,
-    date_diff('day',COALESCE(s.modified_time, t.last_connected),CAST(d.max_date AS TIMESTAMP))AS days_for_soc_depletion
+    COALESCE(CAST(s.modified_time AS TIMESTAMP), CAST(t.last_connected AS TIMESTAMP)) AS soc_depletion_ts,
+    date_diff('day', CAST(COALESCE(CAST(s.modified_time AS TIMESTAMP), CAST(t.last_connected AS TIMESTAMP)) AS DATE), d.max_date) AS days_for_soc_depletion
 FROM temp t
 CROSS JOIN dates d
-LEFT JOIN swaps s ON t.battery_oem_no = s.oem AND s.rnk = 1
+LEFT JOIN swaps s ON t.battery_oem_no = s.oem

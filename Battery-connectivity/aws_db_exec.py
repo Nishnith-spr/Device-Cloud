@@ -19,7 +19,7 @@ def get_s3_client():
         )
     return _S3_CLIENT
 
-def run_query(client, query, database, s3_output, poll_interval=1, timeout=300):
+def run_query(client, query, database, s3_output, poll_interval=1, timeout=1800):
     """
     Starts an Athena query and polls for completion.
     """
@@ -31,25 +31,39 @@ def run_query(client, query, database, s3_output, poll_interval=1, timeout=300):
 
     qid = resp["QueryExecutionId"]
     start_time = time.time()
-
+    print(f"Query {qid} started...")
+    
+    spinner = ["|", "/", "-", "\\"]
+    idx = 0
+    
     while True:
         status_resp = client.get_query_execution(QueryExecutionId=qid)
         state = status_resp["QueryExecution"]["Status"]["State"]
         
+        elapsed = int(time.time() - start_time)
+        
         if state == "SUCCEEDED":
-            print(f"\nQuery {qid} succeeded.")
+            print(f"\n✅ Query {qid} succeeded in {elapsed}s.")
             break
         if state in ("FAILED", "CANCELLED"):
             reason = status_resp["QueryExecution"]["Status"].get("StateChangeReason", "No reason provided")
-            print(f"\nQuery {qid} {state}")
+            print(f"\n❌ Query {qid} {state}")
             raise RuntimeError(f"Athena query {state}: {reason}")
         
-        if time.time() - start_time > timeout:
+        if elapsed > timeout:
             client.stop_query_execution(QueryExecutionId=qid)
-            print(f"\nQuery {qid} TIMEOUT")
+            print(f"\n⏲️ Query {qid} TIMEOUT")
             raise RuntimeError(f"Athena query TIMEOUT after {timeout} seconds")
             
-        print(f"Query is {state:10} ({int(time.time() - start_time)}s elapsed)...", end="\r")
+        # Fancy Progress Bar
+        bar_len = 20
+        # Since we don't know total time, we use a cycling bar for "running"
+        filled = (elapsed // 2) % bar_len
+        bar = "█" * filled + "▒" * (bar_len - filled)
+        
+        print(f"  [{bar}] {spinner[idx % 4]} {state:10} | {elapsed}s elapsed...", end="\r")
+        
+        idx += 1
         time.sleep(poll_interval)
 
     return qid

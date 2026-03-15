@@ -3,22 +3,24 @@ WITH dates AS (
 ),
 
 base AS (
-    SELECT upper(b.battery_oem_no) AS battery_oem_no,
+    SELECT upper(trim(b.battery_oem_no)) AS battery_oem_no,
            substr(upper(b.battery_oem_no), 1, 1) AS oem_prefix,
            MAX_BY(b.country_code, CASE WHEN b.country_code IS NOT NULL THEN b.modified_time ELSE NULL END) AS country_code
-    FROM "AWSDataCatalog"."prod_landing_db"."atlas_battery_360" b
+    FROM "AWSDataCatalog"."prod_staging_db"."atlas_battery_360_events" b
     CROSS JOIN dates d
-    WHERE substr(upper(b.battery_oem_no), 1, 1) IN ('U', 'A', 'C', '7', '8', 'D')
+    WHERE substr(upper(b.battery_oem_no), 1, 1) IN ('U', 'A', 'C', '7', '8')  -- Removed 'D' (Greenway-2)
       AND length(b.battery_oem_no) IN (15, 18)
       AND CAST(b.modified_time AS DATE) <= d.max_date
-    GROUP BY upper(b.battery_oem_no)
+      AND b.country_code IS NOT NULL
+      AND upper(b.country_code) != 'TZ'               -- Exclude Tanzania
+    GROUP BY upper(trim(b.battery_oem_no)), substr(upper(b.battery_oem_no), 1, 1)
 ),
 
 cbak AS (
     SELECT t.bmsid AS battery_id,
            MAX(from_unixtime(t._time / 1000000000)) AS last_connected,
            MAX_BY(CAST(t.soc AS DOUBLE), t._time) AS soc,
-           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(from_unixtime(t._time / 1000000000) AS DATE), d.max_date) < 7 
+           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(from_unixtime(t._time / 1000000000) AS DATE), d.max_date) < {{health_window}} 
                                THEN date_trunc('hour', from_unixtime(t._time / 1000000000)) END) AS week_pac
     FROM "AWSDataCatalog"."prod_landing_db"."iot_hubtrakmate" t
     CROSS JOIN dates d
@@ -32,7 +34,7 @@ unique_bat AS (
     SELECT t.batid AS battery_id,
            MAX(from_unixtime(t._time / 1000000000)) AS last_connected,
            MAX_BY(CAST(t.soc AS DOUBLE), t._time) AS soc,
-           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(from_unixtime(t._time / 1000000000) AS DATE), d.max_date) < 7 
+           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(from_unixtime(t._time / 1000000000) AS DATE), d.max_date) < {{health_window}} 
                                THEN date_trunc('hour', from_unixtime(t._time / 1000000000)) END) AS week_pac
     FROM "AWSDataCatalog"."prod_landing_db"."iot_hub6" t
     CROSS JOIN dates d
@@ -45,7 +47,7 @@ amp_green AS (
     SELECT t.bms_id AS battery_id,
            MAX(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)) AS last_connected,
            MAX_BY(CAST(t.battery_soc AS DOUBLE), t.device_time) AS soc,
-           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000) AS DATE), d.max_date) < 7 
+           COUNT(DISTINCT CASE WHEN date_diff('day', CAST(FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000) AS DATE), d.max_date) < {{health_window}} 
                                THEN date_trunc('hour', FROM_UNIXTIME(CAST(t.device_time AS DOUBLE) / 1000)) END) AS week_pac
     FROM "Data-Athena-Prod"."landing_db"."iot_bms_telemetry_critical" t
     CROSS JOIN dates d
@@ -81,7 +83,6 @@ temp AS (
                WHEN 'A' THEN 'Ampace'
                WHEN '7' THEN 'Greenway-1'
                WHEN '8' THEN 'Greenway-1'
-               WHEN 'D' THEN 'Greenway-2'
            END AS battery_family,
            c.last_connected,
            date_diff('day', CAST(c.last_connected AS DATE), d.max_date) AS days_from_last_connected,
@@ -118,7 +119,7 @@ swaps AS (
            MAX_BY(e.tag, e.modified_time) AS tag,
            COUNT(*) AS total_swaps,
            COUNT(CASE WHEN CAST(e.modified_time AS TIMESTAMP) > CAST(t.last_connected AS TIMESTAMP) THEN 1 END) AS swaps_after_last_connected,
-           COUNT(CASE WHEN date_diff('day', CAST(e.modified_time AS DATE), d.max_date) <= 7 THEN 1 END) AS circulation_batteries
+           COUNT(CASE WHEN date_diff('day', CAST(e.modified_time AS DATE), d.max_date) <= {{health_window}} THEN 1 END) AS circulation_batteries
     FROM swap_events e
     CROSS JOIN dates d
     INNER JOIN temp t ON upper(e.oem) = t.battery_oem_no

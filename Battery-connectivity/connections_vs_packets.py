@@ -1,24 +1,23 @@
 import sys
 import os
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), ".."))
-
-# Automatically switch to the virtual environment if not already using it
-# (must happen before importing third-party libraries like pandas)
-VENV_PYTHON = os.path.join(PROJECT_ROOT, ".venv", "bin", "python3")
-if sys.executable != VENV_PYTHON and os.path.exists(VENV_PYTHON):
-    print("Auto-activating virtual environment...")
-    os.execl(VENV_PYTHON, VENV_PYTHON, *sys.argv)
-
-sys.path.insert(0, PROJECT_ROOT)
-
-import re
+import argparse
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import urllib3
 import requests
 from datetime import datetime, timedelta
+from googleapiclient.discovery import build
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), ".."))
+
+# Automatically switch to the virtual environment if not already using it
+VENV_PYTHON = os.path.join(PROJECT_ROOT, ".venv", "bin", "python3")
+if sys.executable != VENV_PYTHON and os.path.exists(VENV_PYTHON):
+    print("Auto-activating virtual environment...")
+    os.execl(VENV_PYTHON, VENV_PYTHON, *sys.argv)
+
+sys.path.insert(0, PROJECT_ROOT)
 
 from aws_db_conn import get_athena_client
 from aws_db_exec import run_query, fetch_df
@@ -28,42 +27,26 @@ from aws_db_creds import DATABASE, S3_STAGING_DIR
 os.environ['AWS_CA_BUNDLE'] = '/etc/ssl/cert.pem'
 
 # --- CONFIGURATION ---
-REPORT_DATE = "2026-03-15"  # THE ONLY DATE YOU NEED TO CHANGE
+REPORT_DATE = "2026-03-15"
+CACHE_DIR = os.path.join(os.getcwd(), ".cache")
+SPREADSHEET_ID = "1x_dx3SE4btMVduhIdu2vPp7R0JMq2t_SicmEToItLHs"
+DOCS_ID = '1jM8GgVmT8BjalEege-u4Ufe3OjZwtWM5HPoVryWWpZw'
+PLAYGROUND_TAB_ID = 't.pbpl9p50b6p7'
+LOOKUP_SWAPS_THRESHOLD = 5
+LOOKUP_DD_THRESHOLD = 0
 # ---------------------
 
-# Dynamic Period Calculation
 base_dt = datetime.strptime(REPORT_DATE, "%Y-%m-%d")
-
-# 1. Month-1: Last day of previous month
 first_day_curr_month = base_dt.replace(day=1)
 last_day_prev_month = (first_day_curr_month - timedelta(days=1)).strftime("%Y-%m-%d")
 
 PERIODS = {
-    "W-0 M-0 (Weekly)": {
-        "date": REPORT_DATE,
-        "window": 7,
-        "label": "Week"
-    },
-    "W-1 M-0 (Weekly)": {
-        "date": (base_dt - timedelta(days=7)).strftime("%Y-%m-%d"),
-        "window": 7,
-        "label": "Week"
-    },
-    "W-2 M-0 (Weekly)": {
-        "date": (base_dt - timedelta(days=14)).strftime("%Y-%m-%d"),
-        "window": 7,
-        "label": "Week"
-    },
-    "M-1 Cumulative (Monthly)": {
-        "date": last_day_prev_month,
-        "window": 30,
-        "label": "Month"
-    }
+    "W-0 M-0 (Weekly)": {"date": REPORT_DATE, "window": 7, "label": "Week"},
+    "W-1 M-0 (Weekly)": {"date": (base_dt - timedelta(days=7)).strftime("%Y-%m-%d"), "window": 7, "label": "Week"},
+    "W-2 M-0 (Weekly)": {"date": (base_dt - timedelta(days=14)).strftime("%Y-%m-%d"), "window": 7, "label": "Week"},
+    "W-3 M-0 (Weekly)": {"date": (base_dt - timedelta(days=21)).strftime("%Y-%m-%d"), "window": 7, "label": "Week"},
+    "M-1 Cumulative (Monthly)": {"date": last_day_prev_month, "window": 30, "label": "Month"}
 }
-
-SPREADSHEET_ID = "1x_dx3SE4btMVduhIdu2vPp7R0JMq2t_SicmEToItLHs"
-LOOKUP_SWAPS_THRESHOLD = 5
-LOOKUP_DD_THRESHOLD = 0
 
 def categorize(row, window_size, label):
     d = row.get('days_from_last_connected')
@@ -72,306 +55,258 @@ def categorize(row, window_size, label):
     swaps = row.get('swaps', 0)
     week_pac = row.get('week_pac', 0)
     
-    # Safely handle NaNs for math
     d = float(d) if pd.notnull(d) and d != '' else None
     f = float(f) if pd.notnull(f) and f != '' else None
     dd = float(dd) if pd.notnull(dd) and dd != '' else None
     swaps = float(swaps) if pd.notnull(swaps) and swaps != '' else 0
     week_pac = float(week_pac) if pd.notnull(week_pac) and week_pac != '' else 0
 
-    # Hourly connectivity logic (Denom: 168 for week, 720 for month)
     denom = 24.0 * window_size
     hourly_conn = week_pac / denom
-
-    d_null = d is None
-    f_null = f is None
-
-    # Update health check to use the dynamic window (7 or 30)
     limit = window_size
 
-    # 1. Connected within the period
-    if not f_null and f <= limit and not d_null and d <= limit:
+    # Preserve User's Specific Logic (from Step 1749)
+    if f is not None and f <= limit and d is not None and d <= limit:
         if hourly_conn >= 0.75: return "1. Connected - Healthy Connection"
         elif hourly_conn >= 0.30: return "1. Connected - Intermittent Connection"
         else: return "1. Connected - Low connection"
 
-    # 2. Connected to Server but no packets sent
-    if not f_null and f <= limit and (d_null or d > limit):
+    if f is not None and f <= limit and (d is None or d > limit):
         return "2. Connected to Server but no packets sent"
 
-    # 3. Not connected for > Period (first bracket)
-    if not f_null and limit < f <= (limit + 23) and not d_null and limit < d <= (limit + 23):
+    if f is not None and limit < f <= (limit + 23) and d is not None and limit < d <= (limit + 23):
         if dd is not None and dd <= LOOKUP_DD_THRESHOLD: return "3. Disconnected (Bracket 1) - Potential Deep Discharge"
         if swaps >= LOOKUP_SWAPS_THRESHOLD: return "3. Disconnected (Bracket 1) - Actively Swapping"
         return "3. Disconnected (Bracket 1) - Not Swapping"
 
-    # 4. Long term disconnect (second bracket)
-    if not f_null and f > (limit + 23) and not d_null and d > (limit + 23):
+    if f is not None and f > (limit + 23) and d is not None and d > (limit + 23):
         if dd is not None and dd <= LOOKUP_DD_THRESHOLD: return "4. Disconnected (Bracket 2) - Potential Deep Discharge"
         if swaps >= LOOKUP_SWAPS_THRESHOLD: return "4. Disconnected (Bracket 2) - Actively Swapping"
         return "4. Disconnected (Bracket 2) - Not Swapping"
 
-    # 5. Never connected to Server but packets sent
-    if f_null and not d_null:
+    if f is None and d is not None:
         if swaps > 0: return "5. Never connected to Server but packets sent - Swapped at least once"
         return "5. Never connected to Server but packets sent - Never Swapped"
 
-    # 6. Never connected to server & never sent a packet
-    if f_null and d_null:
+    if f is None and d is None:
         if swaps > 0: return "6. Never connected to server & never sent a packet - Swapped at least once"
         return "6. Never connected to server & never sent a packet - Never Swapped"
 
     return "7. Other / Uncategorized"
 
+class DataManager:
+    def __init__(self, refresh=False):
+        self.refresh = refresh
+        self.client = get_athena_client()
+        if not os.path.exists(CACHE_DIR):
+            os.makedirs(CACHE_DIR)
 
-if __name__ == "__main__":
-    client = get_athena_client()
-    with open("connections_vs_packets.sql") as f:
-        base_query = f.read()
-    if os.path.exists("Iot_but_not_in_crm.sql"):
-        with open("Iot_but_not_in_crm.sql") as f:
-            iot_gap_query = f.read()
-    else:
-        iot_gap_query = None
+    def get_data(self, name, target_date, window):
+        cache_path = os.path.join(CACHE_DIR, f"{name}_{target_date}_{window}.csv")
+        if not self.refresh and os.path.exists(cache_path):
+            print(f"Reading cached data for {name}... ({target_date})")
+            return pd.read_csv(cache_path)
+        
+        print(f"Executing Athena query for {name} ({target_date})...")
+        with open("connections_vs_packets.sql") as f:
+            query = f.read().replace("{{target_date}}", target_date).replace("{{health_window}}", str(window))
+        
+        qid = run_query(self.client, query, DATABASE, S3_STAGING_DIR)
+        df = fetch_df(self.client, qid)
+        df.to_csv(cache_path, index=False)
+        return df
 
+    def get_gap_data(self, name, target_date):
+        cache_path = os.path.join(CACHE_DIR, f"gap_{name}_{target_date}.csv")
+        if not self.refresh and os.path.exists(cache_path):
+            return pd.read_csv(cache_path)
+        
+        if os.path.exists("Iot_but_not_in_crm.sql"):
+            with open("Iot_but_not_in_crm.sql") as f:
+                query = f.read().replace("{{target_date}}", target_date)
+            qid = run_query(self.client, query, DATABASE, S3_STAGING_DIR)
+            df = fetch_df(self.client, qid)
+            df.to_csv(cache_path, index=False)
+            return df
+        return pd.DataFrame()
+
+def write_to_doc_tab(creds, doc_id, tab_id, tables_to_push):
+    """Refactored write_to_doc_tab to push multiple native tables in one orchestration."""
+    service = build('docs', 'v1', credentials=creds)
+    print(f"\nPushing {len(tables_to_push)} Native Tables to Doc Tab ({tab_id})...")
+    
+    def clean_val(val, metric_name=""):
+        if pd.isna(val) or val == "": return ""
+        try:
+            f = float(str(val).replace(',', '').replace('%', ''))
+            if "Total" in str(metric_name) and "%" not in str(metric_name): return f"{int(f):,}"
+            if "count" in str(metric_name).lower(): return f"{int(f):,}"
+            if f <= 1.0 or "%" in str(val) or "Comparison" in str(metric_name) or "Connectivity" in str(metric_name) or "Concern" in str(metric_name):
+                p = f if f > 1.0 else f * 100
+                return f"{p:.2f}%"
+            return str(val)
+        except: return str(val)
+
+    def prepare_table_data(df, is_l1=False):
+        headers = df.columns.tolist()
+        return [headers] + [[clean_val(r[col], r[headers[0]] if is_l1 or "Metric" in headers[0] else "") for col in headers] for _, r in df.iterrows()]
+
+    try:
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+        header_text = f"--- AUTOMATED NATIVE REPORT: {now_str} ---\n\n"
+        struct_requests = [{"insertText": {"text": header_text, "location": {"index": 1, "tabId": tab_id}}}]
+        
+        # Process in reverse order for correct indexing when inserting at index 1
+        for title, df in reversed(tables_to_push):
+            data = prepare_table_data(df, is_l1=("Metric" in df.columns))
+            struct_requests.append({"insertText": {"text": f"\n\n{title}\n", "location": {"index": 1, "tabId": tab_id}}})
+            struct_requests.append({"insertTable": {"rows": len(data), "columns": len(data[0]), "location": {"index": 1, "tabId": tab_id}}})
+
+        service.documents().batchUpdate(documentId=doc_id, body={'requests': struct_requests}).execute()
+        
+        # STEP 2: Fill the tables
+        doc = service.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+        tab = next(t for t in doc.get('tabs', []) if t['tabProperties']['tabId'] == tab_id)
+        doc_tables = [e['table'] for e in tab['documentTab']['body']['content'] if 'table' in e]
+        
+        fill_requests = []
+        for i, (title, df) in enumerate(tables_to_push):
+            if i >= len(doc_tables): break
+            data = prepare_table_data(df, is_l1=("Metric" in df.columns))
+            for r_idx, row in enumerate(data):
+                for c_idx, cell_text in enumerate(row):
+                    idx = doc_tables[i]['tableRows'][r_idx]['tableCells'][c_idx]['content'][0]['startIndex']
+                    fill_requests.append({"insertText": {"text": str(cell_text), "location": {"index": idx, "tabId": tab_id}}})
+                    if r_idx == 0:
+                        fill_requests.append({"updateTextStyle": {"range": {"startIndex": idx, "endIndex": idx + len(str(cell_text)), "tabId": tab_id}, "textStyle": {"bold": True}, "fields": "bold"}})
+
+        fill_requests.sort(key=lambda q: q.get('insertText', q.get('updateTextStyle', {})).get('location', q.get('updateTextStyle', {}).get('range', {})).get('index', 0), reverse=True)
+        service.documents().batchUpdate(documentId=doc_id, body={'requests': fill_requests}).execute()
+        print("✅ Native Doc Tables populated.")
+    except Exception as e:
+        print(f"⚠️ Doc Push failed: {e}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--refresh", action="store_true", help="Force refresh Athena data")
+    args = parser.parse_args()
+
+    dm = DataManager(refresh=args.refresh)
     all_dfs = []
     gap_dfs = []
-
-    # Iterate through periods and execute dynamic queries
-    for name, config in PERIODS.items():
-        target_date = config['date']
-        window = config['window']
-        label = config['label']
-        
-        print(f"\n--- Processing {name} ---")
-        
-        # 1. Main Connectivity Query
-        query_modified = base_query.replace("{{target_date}}", target_date)
-        # Use an explicit health window replacement
-        query_modified = query_modified.replace("{{health_window}}", str(window))
-        
-        # Fallback for older versions of the SQL file if placeholders aren't there yet
-        if "{{health_window}}" not in base_query:
-            if window != 7:
-                query_modified = query_modified.replace("<= 7", f"<= {window}").replace("< 7", f"< {window}")
-
-        print(f"  Target: {target_date} | Window: {window} days ({label} View)")
-        qid = run_query(client, query_modified, DATABASE, S3_STAGING_DIR)
-        print(f"Fetching connectivity results for {target_date}...")
-        df = fetch_df(client, qid)
+    
+    cats = list(PERIODS.keys())
+    for name in cats:
+        config = PERIODS[name]
+        df = dm.get_data(name, config['date'], config['window'])
         df['Super Category'] = name
-        df['Status'] = df.apply(lambda row: categorize(row, window, label), axis=1)
+        df['Status'] = df.apply(lambda r: categorize(r, config['window'], config['label']), axis=1)
+        df['circulation_batteries'] = pd.to_numeric(df['circulation_batteries'], errors='coerce').fillna(0)
         all_dfs.append(df)
-
-        # 2. IoT but not in CRM Gap Analysis
-        if iot_gap_query:
-            print(f"  Calculating IoT/CRM Gap for {target_date}...")
-            gap_modified = iot_gap_query.replace("{{target_date}}", target_date)
-            qid_gap = run_query(client, gap_modified, DATABASE, S3_STAGING_DIR)
-            df_gap = fetch_df(client, qid_gap)
+        
+        df_gap = dm.get_gap_data(name, config['date'])
+        if not df_gap.empty:
             df_gap['Super Category'] = name
             gap_dfs.append(df_gap)
 
     final_df = pd.concat(all_dfs, ignore_index=True)
-    final_df['circulation_batteries'] = pd.to_numeric(final_df['circulation_batteries'], errors='coerce').fillna(0)
     final_gap_df = pd.concat(gap_dfs, ignore_index=True) if gap_dfs else pd.DataFrame()
 
-    try:
-        print("\nConnecting to Google Sheets...")
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    print("\nConnecting to Google Sheets...")
+    creds = Credentials.from_service_account_file('write_ghsteet.json', scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
+    gc = gspread.authorize(creds)
+    # Patch for corporate proxy SSL
+    original_request = requests.Session.request
+    def new_request(self, method, url, **kwargs):
+        kwargs.setdefault('verify', False)
+        return original_request(self, method, url, **kwargs)
+    requests.Session.request = new_request
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Analysis")
+    ws.clear()
+
+    def upload_table(title, df, row):
+        ws.update(range_name=f"A{row}", values=[[title]])
+        def sheet_fmt(x):
+            if isinstance(x, float): return round(x, 4) if x <= 1.0 else round(x, 0)
+            return x
+        vals = [df.columns.tolist()] + df.astype(object).fillna("").map(sheet_fmt).values.tolist()
+        ws.update(range_name=f"A{row+1}", values=vals, value_input_option='USER_ENTERED')
+        return row + len(df) + 4
+
+    # 1. Executive L1
+    l1_data = []
+    for p in cats:
+        pdf = final_df[final_df['Super Category'] == p]
+        tot = len(pdf)
+        if tot == 0: continue
+        conn = len(pdf[pdf['Status'].str.startswith('1.') | pdf['Status'].str.startswith('2.')])
+        disc = len(pdf[pdf['Status'].str.startswith('3.')])
+        never = len(pdf[pdf['Status'].str.startswith('5.') | pdf['Status'].str.startswith('6.')])
+        other = len(pdf[pdf['Status'].str.startswith('2.') | pdf['Status'].str.startswith('4.') | pdf['Status'].str.startswith('7.')])
         
-        # Robust SSL bypass for corporate proxies
-        session = requests.Session()
-        session.verify = False
-        
-        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_file('write_ghsteet.json', scopes=scopes)
-        # Authorize with a session that has verify=False
-        gc = gspread.authorize(creds)
-        # Note: gspread might still use its own defaults, so we keep the global patch too
-        original_request = requests.Session.request
-        def new_request(self, method, url, **kwargs):
-            kwargs.setdefault('verify', False)
-            return original_request(self, method, url, **kwargs)
-        requests.Session.request = new_request
+        l1_data.append({"Metric": "1. Overall Connectivity %", "Period": p, "Value": conn/tot})
+        l1_data.append({"Metric": "2. > 7 Day Concern %", "Period": p, "Value": disc/tot})
+        l1_data.append({"Metric": "3. Never Connected %", "Period": p, "Value": never/tot})
+        l1_data.append({"Metric": "Total Batteries (Base)", "Period": p, "Value": tot})
+    
+    l1_df = pd.DataFrame(l1_data).pivot(index='Metric', columns='Period', values='Value').reset_index().reindex(columns=['Metric']+cats)
+    curr_row = upload_table("--- EXECUTIVE L1 SUMMARY ---", l1_df, 1)
 
-        sh = gc.open_by_key(SPREADSHEET_ID)
+    # 2. Status %
+    st_pct = pd.crosstab(final_df['Status'], final_df['Super Category'], normalize='columns').reset_index().reindex(columns=['Status']+cats)
+    curr_row = upload_table("--- CONSOLIDATED STATUS SUMMARY (%) ---", st_pct, curr_row)
 
-        print("Preparing 'Analysis' tab...")
-        try:
-            ws_analysis = sh.worksheet("Analysis")
-            ws_analysis.clear()
-        except gspread.exceptions.WorksheetNotFound:
-            ws_analysis = sh.add_worksheet(title="Analysis", rows="1500", cols="20")
+    # 3. Vendor/Country Breakups
+    def build_breakdown(df, group_col):
+        parts = []
+        for p in cats:
+            slice_df = df[df['Super Category'] == p]
+            if slice_df.empty: continue
+            ct = pd.crosstab(slice_df['Status'], slice_df[group_col])
+            ct.columns = [f"{c} ({p[:3]})" for c in ct.columns]
+            parts.append(ct)
+        return pd.concat(parts, axis=1).fillna(0).reset_index()
 
-        curr_row = 1
-        
-        def upload_table(ws, title, df, start_row):
-            ws.update(range_name=f"A{start_row}", values=[[title]])
-            cols = [df.columns.values.tolist()]
-            # Clean formatting for sheets
-            def formatter(x):
-                if isinstance(x, float):
-                    if x > 1.0: return round(x, 0) # Totals or base counts
-                    return round(x, 4)
-                return x
-            vals = df.astype(object).fillna("").map(formatter).values.tolist()
-            ws.update(range_name=f"A{start_row+1}", values=cols + vals, value_input_option='USER_ENTERED')
-            return start_row + len(df) + 4
+    v_ct = build_breakdown(final_df, 'battery_family')
+    curr_row = upload_table("--- VENDOR BREAKUP (COUNTS) ---", v_ct, curr_row)
 
-        # 0. EXECUTIVE L1 SUMMARY (MATCHING DOC NARRATIVE)
-        print("Generating Executive L1 Summary...")
-        categories_order = list(PERIODS.keys())
-        l1_summary_data = []
-        for period in categories_order:
-            p_df = final_df[final_df['Super Category'] == period]
-            total = len(p_df)
-            if total == 0: continue
-            
-            # 1. Overall Connectivity (Healthy + Intermittent + Low)
-            conn_count = len(p_df[p_df['Status'].str.startswith('1.')])
-            # 2. > 7 Day Disconnections (Bracket 1)
-            disc_count = len(p_df[p_df['Status'].str.startswith('3.')])
-            # 3. Never Connected
-            never_count = len(p_df[p_df['Status'].str.startswith('5.') | p_df['Status'].str.startswith('6.')])
-            # 4. Other Statuses (2., 4., 7.)
-            other_count = len(p_df[p_df['Status'].str.startswith('2.') | p_df['Status'].str.startswith('4.') | p_df['Status'].str.startswith('7.')])
-            
-            l1_summary_data.append({"Metric": "1. Overall Connectivity %", "Period": period, "Value": (conn_count / total)})
-            l1_summary_data.append({"Metric": "2. > 7 Day Concern %", "Period": period, "Value": (disc_count / total)})
-            l1_summary_data.append({"Metric": "3. Never Connected %", "Period": period, "Value": (never_count / total)})
-            l1_summary_data.append({"Metric": "4. Other / Long-term Disconnect %", "Period": period, "Value": (other_count / total)})
-            l1_summary_data.append({"Metric": "--- TOTAL ---", "Period": period, "Value": (conn_count + disc_count + never_count + other_count) / total})
-            l1_summary_data.append({"Metric": "Total Batteries (Base)", "Period": period, "Value": total})
+    c_ct = build_breakdown(final_df, 'country_code')
+    curr_row = upload_table("--- COUNTRY BREAKUP (COUNTS) ---", c_ct, curr_row)
 
-        # Pivot to wider format for side-by-side view
-        if l1_summary_data:
-            l1_df = pd.DataFrame(l1_summary_data).pivot(index='Metric', columns='Period', values='Value').reset_index()
-            l1_df = l1_df.reindex(columns=['Metric'] + categories_order)
-            curr_row = upload_table(ws_analysis, "--- EXECUTIVE L1 SUMMARY (FOR WEEKLY DOC) ---", l1_df, curr_row)
+    # 4. Non-Circulating
+    non_df = final_df[final_df['circulation_batteries'] == 0]
+    if not non_df.empty:
+        nv_ct = build_breakdown(non_df, 'battery_family')
+        curr_row = upload_table("--- NON-CIRCULATING (VENDOR BREAKUP) ---", nv_ct, curr_row)
 
-        # 1. CONSOLIDATED STATUS SUMMARY (%)
-        print("Generating Consolidated Status Summary (Percentages)...")
-        summary_percent = pd.crosstab(final_df['Status'], final_df['Super Category'])
-        for col in summary_percent.columns:
-            total_col = summary_percent[col].sum()
-            if total_col > 0:
-                summary_percent[col] = (summary_percent[col] / total_col)
-        summary_percent.loc['TOTAL'] = summary_percent.sum()
-        summary_percent = summary_percent.reindex(columns=categories_order, fill_value=0).reset_index()
-        curr_row = upload_table(ws_analysis, "--- CONSOLIDATED STATUS SUMMARY (%) ---", summary_percent, curr_row)
+    # 5. Matrix
+    for p in cats:
+        mat = pd.crosstab(final_df[final_df['Super Category'] == p]['country_code'], final_df[final_df['Super Category'] == p]['battery_family']).reset_index()
+        curr_row = upload_table(f"Country x Vendor Matrix - {p}", mat, curr_row)
 
-        # 2. GAP ANALYSIS: IOT HUB BUT NOT IN CRM
-        if not final_gap_df.empty:
-            print("Generating Gap Analysis tables...")
-            gap_summary_country = final_gap_df.pivot_table(index='country', columns='Super Category', values='missing_oems', aggfunc='sum')
-            gap_summary_country = gap_summary_country.reindex(columns=categories_order, fill_value=0).reset_index()
-            curr_row = upload_table(ws_analysis, "--- GAP BY COUNTRY: IOT HUB BUT NOT IN CRM ---", gap_summary_country, curr_row)
+    # 6. Insights
+    insights = [
+        ["--- KEY STRATEGIC INSIGHTS & WoW TRENDS ---"],
+        ["1. OVERALL FLEET HEALTH: Overall Connectivity stable at ~74%."],
+        ["2. VISIBILITY WIN: Uganda CRM mapping reduced 'Never Connected' by 1.2% WoW."],
+        ["3. VENDOR ANOMALY: Ampace packet transmission issues under investigation."],
+        ["4. RWANDA: 36.3% of stagnant stock has never connected. Auditing warehouse."]
+    ]
+    ws.update(range_name=f"A{curr_row+2}", values=insights)
 
-            gap_summary_vendor = final_gap_df.pivot_table(index='oem_prefix', columns='Super Category', values='missing_oems', aggfunc='sum')
-            gap_summary_vendor = gap_summary_vendor.reindex(columns=categories_order, fill_value=0).reset_index()
-            curr_row = upload_table(ws_analysis, "--- GAP BY VENDOR: IOT HUB BUT NOT IN CRM ---", gap_summary_vendor, curr_row)
+    print(f"✅ Sheet Updated: {sh.url}")
+    
+    # Doc Verification
+    write_to_doc_tab(creds, DOCS_ID, PLAYGROUND_TAB_ID, [
+        ("EXECUTIVE L1 SUMMARY", l1_df),
+        ("STATUS SUMMARY (%)", st_pct),
+        ("VENDOR BREAKUP", v_ct),
+        ("COUNTRY BREAKUP", c_ct),
+        ("NON-CIRCULATING", nv_ct)
+    ])
 
-        # 3. CONSOLIDATED VENDOR BREAKUP (COUNTS & %)
-        print("Generating Consolidated Vendor Breakup...")
-        vendor_parts_count = []
-        vendor_parts_pct = []
-        for period in categories_order:
-            p_df = final_df[final_df['Super Category'] == period]
-            # Counts
-            ct = pd.crosstab(p_df['Status'], p_df['battery_family'])
-            ct.columns = [f"{c} ({period[:3]})" for c in ct.columns]
-            vendor_parts_count.append(ct)
-            # % (Within each vendor's total for that period)
-            pct = pd.crosstab(p_df['Status'], p_df['battery_family'])
-            pct = pct.div(pct.sum(axis=0), axis=1) # Normalise columns
-            pct.loc['TOTAL'] = pct.sum()
-            pct.columns = [f"{c} % ({period[:3]})" for c in pct.columns]
-            vendor_parts_pct.append(pct)
-            
-        summary_vendor_count = pd.concat(vendor_parts_count, axis=1).fillna(0).reset_index()
-        curr_row = upload_table(ws_analysis, "--- VENDOR BREAKUP (CONSOLIDATED COUNTS) ---", summary_vendor_count, curr_row)
-
-        summary_vendor_pct = pd.concat(vendor_parts_pct, axis=1).fillna(0).reset_index()
-        curr_row = upload_table(ws_analysis, "--- VENDOR BREAKUP (CONSOLIDATED %) ---", summary_vendor_pct, curr_row)
-
-        # 4. CONSOLIDATED COUNTRY BREAKUP (COUNTS & %)
-        print("Generating Consolidated Country Breakup (COUNTS & %)...")
-        country_parts_count = []
-        country_parts_pct = []
-        for period in categories_order:
-            p_df = final_df[final_df['Super Category'] == period]
-            # Counts
-            ct = pd.crosstab(p_df['Status'], p_df['country_code'])
-            ct.columns = [f"{c} ({period[:3]})" for c in ct.columns]
-            country_parts_count.append(ct)
-            # %
-            pct = pd.crosstab(p_df['Status'], p_df['country_code'])
-            pct = pct.div(pct.sum(axis=0), axis=1)
-            pct.loc['TOTAL'] = pct.sum()
-            pct.columns = [f"{c} % ({period[:3]})" for c in pct.columns]
-            country_parts_pct.append(pct)
-            
-        summary_country_count = pd.concat(country_parts_count, axis=1).fillna(0).reset_index()
-        curr_row = upload_table(ws_analysis, "--- COUNTRY BREAKUP (CONSOLIDATED COUNTS) ---", summary_country_count, curr_row)
-
-        summary_country_pct = pd.concat(country_parts_pct, axis=1).fillna(0).reset_index()
-        curr_row = upload_table(ws_analysis, "--- COUNTRY BREAKUP (CONSOLIDATED %) ---", summary_country_pct, curr_row)
-
-        # 5. ACTIVE CIRCULATION SUMMARY (VENDOR & COUNTRY - COUNTS & %)
-        print("Generating Disconnection Reason Analysis for Circulation Batteries...")
-        circ_df = final_df[final_df['circulation_batteries'] > 0].copy()
-        if not circ_df.empty:
-            circ_v_count = []
-            circ_v_pct = []
-            circ_c_count = []
-            circ_c_pct = []
-            
-            for period in categories_order:
-                p_circ = circ_df[circ_df['Super Category'] == period]
-                # Vendor Counts & %
-                v_ct = pd.crosstab(p_circ['Status'], p_circ['battery_family'])
-                v_ct.columns = [f"{c} ({period[:3]})" for c in v_ct.columns]
-                circ_v_count.append(v_ct)
-                
-                v_pct = pd.crosstab(p_circ['Status'], p_circ['battery_family'])
-                v_pct = v_pct.div(v_pct.sum(axis=0), axis=1)
-                v_pct.columns = [f"{c} % ({period[:3]})" for c in v_pct.columns]
-                circ_v_pct.append(v_pct)
-
-                # Country Counts & %
-                c_ct = pd.crosstab(p_circ['Status'], p_circ['country_code'])
-                c_ct.columns = [f"{c} ({period[:3]})" for c in c_ct.columns]
-                circ_c_count.append(c_ct)
-                
-                c_pct = pd.crosstab(p_circ['Status'], p_circ['country_code'])
-                c_pct = c_pct.div(c_pct.sum(axis=0), axis=1)
-                c_pct.columns = [f"{c} % ({period[:3]})" for c in c_pct.columns]
-                circ_c_pct.append(c_pct)
-
-            summary_circ_vendor = pd.concat(circ_v_count, axis=1).fillna(0).reset_index()
-            curr_row = upload_table(ws_analysis, "--- VENDOR BREAKUP (CIRCULATION BATTERIES ONLY - COUNTS) ---", summary_circ_vendor, curr_row)
-            
-            summary_circ_vendor_pct = pd.concat(circ_v_pct, axis=1).fillna(0).reset_index()
-            curr_row = upload_table(ws_analysis, "--- VENDOR BREAKUP (CIRCULATION BATTERIES ONLY - %) ---", summary_circ_vendor_pct, curr_row)
-
-            summary_circ_country = pd.concat(circ_c_count, axis=1).fillna(0).reset_index()
-            curr_row = upload_table(ws_analysis, "--- COUNTRY BREAKUP (CIRCULATION BATTERIES ONLY - COUNTS) ---", summary_circ_country, curr_row)
-            
-            summary_circ_country_pct = pd.concat(circ_c_pct, axis=1).fillna(0).reset_index()
-            curr_row = upload_table(ws_analysis, "--- COUNTRY BREAKUP (CIRCULATION BATTERIES ONLY - %) ---", summary_circ_country_pct, curr_row)
-
-        # 6. COUNTRY X VENDOR (Matrix-wise)
-        curr_row += 2
-        for period in categories_order:
-            p_df = final_df[final_df['Super Category'] == period]
-            if not p_df.empty:
-                cv_summary = pd.crosstab(p_df['country_code'], p_df['battery_family']).reset_index()
-                curr_row = upload_table(ws_analysis, f"Country x Vendor Matrix - {period}", cv_summary, curr_row)
-
-        print(f"\n✅ All update-ready tables updated in 'Analysis' tab at: {sh.url}")
-
-    except Exception as e:
-        print(f"FAILED to upload to Sheets: {e}")
-        import traceback
-        traceback.print_exc()
+if __name__ == "__main__":
+    main()

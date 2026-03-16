@@ -12,7 +12,7 @@ base AS (
       AND length(b.battery_oem_no) IN (15, 18)
       AND CAST(b.modified_time AS DATE) <= d.max_date
       AND b.country_code IS NOT NULL
-      AND upper(b.country_code) != 'TZ'               -- Exclude Tanzania
+      AND upper(b.country_code) NOT IN ('TZ', 'CM') -- Exclude Tanzania and Cameroon
     GROUP BY upper(trim(b.battery_oem_no)), substr(upper(b.battery_oem_no), 1, 1)
 ),
 

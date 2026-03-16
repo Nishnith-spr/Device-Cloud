@@ -5,7 +5,7 @@ with iot_hub as(
             ROW_NUMBER() OVER (PARTITION BY t.bms_id ORDER BY t.last_updated_time DESC) AS rnk
         FROM "Data-Athena-Prod"."landing_db"."latest_bms" t
         WHERE date(CAST(t.last_updated_time AS TIMESTAMP)) <= DATE '{{target_date}}'
-        and country in('Kenya','Uganda','Rwanda','Tanzania','Cameroon')
+        and country in ('Kenya', 'Uganda', 'Rwanda')
     )
     WHERE rnk = 1
     and oem_prefix in('C','U','7','8','A','D')
